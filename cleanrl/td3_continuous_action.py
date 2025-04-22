@@ -14,6 +14,8 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+from optim.sgd import AlphaGrad
+
 
 @dataclass
 class Args:
@@ -39,11 +41,15 @@ class Args:
     """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
+    optimizer: str = ""
+    """ Optimizer to use"""
+    alpha: float = 0.0
+    """ Alpha value for AlphaGrad"""
 
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -184,8 +190,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+    if args.optimizer == "Adam":
+        q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
+        actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+    if args.optimizer == 'AlphaGrad':
+        q_optimizer = AlphaGrad(list(qf1.parameters()) + list(qf2.parameters()),  lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
+        actor_optimizer = AlphaGrad(list(actor.parameters()),  lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -214,19 +224,26 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    break
+        if "episode" in infos:
+            for i in range(len(infos["episode"]["r"])):
+                episodic_return = infos["episode"]["r"][i].item()
+                episodic_length = infos["episode"]["l"][i].item()
+                print(f"global_step={global_step}, episodic_return={episodic_return}")
+                writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+                if (
+                    "final_observation" in infos
+                    and isinstance(infos["final_observation"], (list, np.ndarray))
+                    and infos["final_observation"][idx] is not None
+                ):
+                    real_next_obs[idx] = infos["final_observation"][idx]
+                else:
+                    real_next_obs[idx] = next_obs[idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
