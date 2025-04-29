@@ -14,6 +14,25 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    from wandb.integration.gym import RecordVideo
+
+    # 1) Ensure the old `if not self.enabled:` check won’t crash
+    RecordVideo.enabled = True
+
+    # 2) Replace close() with a simple passthrough to the wrapped env
+    def _patched_close(self, *args, **kwargs):
+        try:
+            return self.env.close()
+        except Exception:
+            return None
+
+    RecordVideo.close = _patched_close
+
+except ImportError:
+    # wandb not installed or integration changed—no patch needed
+    pass
+
 
 @dataclass
 class Args:
