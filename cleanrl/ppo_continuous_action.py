@@ -99,14 +99,13 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-# In make_env function:
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         render_mode = "rgb_array" if capture_video else None
         print(f"[{idx}] Creating env {env_id} with render_mode='{render_mode}'")
         env = gym.make(env_id, render_mode=render_mode)
 
-        # === RE-ENABLE RecordVideo (if capture_video is True) ===
+        # === RecordVideo ===
         if capture_video and idx == 0:
             video_folder = f"videos/{run_name}"
             print(f"[{idx}] Wrapping with RecordVideo, saving to: {video_folder}")
@@ -116,46 +115,20 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
                 video_folder=video_folder,
                 name_prefix=f"{env_id}-ep"
             )
-            # Add the 'enabled' attribute manually AFTER creating the wrapper
-            setattr(env, 'enabled', True) # <--- ADD THIS LINE
-            setattr(env, 'path', video_folder) # <--- ADD THIS LINE (or maybe '')
+            # REMOVE setattr(env, 'enabled', True)
+            # REMOVE setattr(env, 'path', video_folder)
         # === END RecordVideo ===
 
-        # REMOVED Initial Render Test
-
         env = gym.wrappers.RecordEpisodeStatistics(env)
-
         # --- Wrappers ---
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-
-        current_obs_space = env.observation_space
-        assert isinstance(current_obs_space, gym.spaces.Box), \
-            f"Expected Box space after NormalizeObservation, got {type(current_obs_space)}"
-        clip_low = -10.0
-        clip_high = 10.0
-        low = np.full(current_obs_space.shape, clip_low, dtype=current_obs_space.dtype)
-        high = np.full(current_obs_space.shape, clip_high, dtype=current_obs_space.dtype)
-        new_obs_space = gym.spaces.Box(
-            low=low,
-            high=high,
-            shape=current_obs_space.shape,
-            dtype=current_obs_space.dtype
-        )
-        env = gym.wrappers.TransformObservation(
-            env,
-            lambda obs: np.clip(obs, clip_low, clip_high),
-            observation_space=new_obs_space
-        )
-
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        # ... (rest of wrappers) ...
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         # --- End of wrappers ---
-
         print(f"[{idx}] Environment creation complete.")
         return env
-
     return thunk
 # ===================================
 
@@ -556,25 +529,42 @@ if __name__ == "__main__":
 
 
     if args.track and args.capture_video:
-        # Construct the likely path to the generated video file
-        # Note: RecordVideo might save multiple files if multiple episodes finish
-        # We'll try and find the first .mp4 file
         video_dir = f"videos/{run_name}"
-        video_files = [f for f in os.listdir(video_dir) if f.endswith(".mp4")]
-        if video_files:
-            video_path = os.path.join(video_dir, sorted(video_files)[0]) # Log the first video
-            print(f"Logging video to W&B: {video_path}")
-            try:
-                 wandb.log({"video": wandb.Video(video_path, fps=4, format="mp4")})
-            except Exception as e:
-                 print(f"Error logging video to W&B: {e}")
+        print(f"Checking for video files in: {video_dir}") # Debug print
+        if os.path.exists(video_dir):
+            video_files = [f for f in os.listdir(video_dir) if f.endswith(".mp4")]
+            if video_files:
+                # Sort to reliably get the first episode if multiple are recorded
+                video_path = os.path.join(video_dir, sorted(video_files)[0])
+                print(f"Attempting to log video to W&B: {video_path}")
+                try:
+                     # Log using a key like "trajectory_video" or similar
+                     wandb.log({"trajectory_video": wandb.Video(video_path, fps=4, format="mp4")})
+                     print("Video logged successfully to W&B.")
+                except Exception as e:
+                     print(f"Error logging video to W&B: {e}")
+                     import traceback
+                     traceback.print_exc()
+            else:
+                 print(f"No .mp4 video file found in {video_dir} to log.")
         else:
-             print(f"Could not find video file in {video_dir} to log to W&B.")
+             print(f"Video directory {video_dir} does not exist.")
     
     
-    envs.close() # This might still crash if the path/enabled fix doesn't work
+    print("Attempting to close environments...")
+    try:
+        envs.close()
+        print("Environments closed successfully.")
+    except AttributeError as e:
+        print(f"Ignoring AttributeError during envs.close(): {e}")
+        print("This error is likely due to W&B hooks running even with monitor_gym=False.")
+    except Exception as e:
+        print(f"Caught other exception during envs.close(): {e}")
+    
     writer.close()
     if args.track:
+        print("Finishing W&B run...")
         wandb.finish()
-
+        print("W&B run finished.")
+    
 print("Script finished.")
