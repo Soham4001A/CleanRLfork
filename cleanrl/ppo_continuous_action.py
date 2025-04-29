@@ -106,24 +106,43 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         render_mode = "rgb_array" if capture_video else None
         env = gym.make(env_id, render_mode=render_mode)
 
-        # RecordEpisodeStatistics must be applied BEFORE the W&B wrapper (monitor_gym=True does this automatically)
-        # but AFTER any other wrappers altering termination/truncation conditions if needed.
-        # Applying it early is usually fine.
+        # RecordEpisodeStatistics must be applied BEFORE the W&B wrapper
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        # **** REMOVED gym.wrappers.RecordVideo ****
-        # if capture_video and idx == 0:
-        #     print(f"MAKING VIDEO FOR {run_name}") # Debug print
-        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}",
-        #         # You might need episode_trigger lambda if monitor_gym doesn't record when you want
-        #         # episode_trigger=lambda x: x % 50 == 0 # Example: Record every 50 episodes
-        #     )
-
-        # Keep other wrappers
+        # Apply other wrappers
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.NormalizeObservation(env) # Normalizes obs (often to unit variance)
+
+        # --- START FIX ---
+        # Define the new observation space *after* clipping.
+        # We assume NormalizeObservation results in a Box space.
+        current_obs_space = env.observation_space
+        assert isinstance(current_obs_space, gym.spaces.Box), \
+            f"Expected Box space after NormalizeObservation, got {type(current_obs_space)}"
+
+        # Create bounds matching the np.clip values
+        clip_low = -10.0
+        clip_high = 10.0
+        low = np.full(current_obs_space.shape, clip_low, dtype=current_obs_space.dtype)
+        high = np.full(current_obs_space.shape, clip_high, dtype=current_obs_space.dtype)
+
+        # Create the new observation space description
+        new_obs_space = gym.spaces.Box(
+            low=low,
+            high=high,
+            shape=current_obs_space.shape,
+            dtype=current_obs_space.dtype
+        )
+
+        # Apply the TransformObservation wrapper WITH the new observation_space
+        env = gym.wrappers.TransformObservation(
+            env,
+            lambda obs: np.clip(obs, clip_low, clip_high),
+            observation_space=new_obs_space  # Provide the explicit new space
+        )
+        # --- END FIX ---
+
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
 
