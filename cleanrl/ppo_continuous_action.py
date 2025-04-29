@@ -470,10 +470,15 @@ if __name__ == "__main__":
                         shape=current_obs_space.shape,
                         dtype=current_obs_space.dtype
                     )
+                    # env = gym.wrappers.TransformObservation(
+                    #     env,
+                    #     lambda obs: np.clip(obs, clip_low, clip_high),
+                    #     observation_space=new_obs_space
+                    # )
                     env = gym.wrappers.TransformObservation(
                         env,
-                        lambda obs: np.clip(obs, clip_low, clip_high),
-                        observation_space=new_obs_space
+                        lambda obs: np.clip(obs, -10, 10),
+                        observation_space=env.observation_space # Incorrect: Passing the space *before* clipping
                     )
             
                     env = gym.wrappers.NormalizeReward(env, gamma=gamma)
