@@ -445,20 +445,65 @@ if __name__ == "__main__":
             from cleanrl_utils.evals.ppo_eval import evaluate
 
             # Modify make_env for evaluation (no video capture needed here unless desired)
-            def make_eval_env(env_id, idx, capture_video, run_name, gamma):
-                 def thunk():
-                    # No render_mode needed unless you want to see eval runs (not typical)
-                    env = gym.make(env_id) # render_mode=None
-                    env = gym.wrappers.RecordEpisodeStatistics(env) # Still useful for eval stats
+            def make_env(env_id, idx, capture_video, run_name, gamma):
+                def thunk():
+                    # Set render_mode to 'rgb_array' if capture_video is True for wandb
+                    render_mode = "rgb_array" if capture_video else None
+                    print(f"[{idx}] Creating env {env_id} with render_mode='{render_mode}'") # Debug print
+                    env = gym.make(env_id, render_mode=render_mode)
+            
+                    # === START DEBUG RENDER TEST ===
+                    if render_mode == "rgb_array" and idx == 0: # Only test for the env that should capture video
+                         print(f"[{idx}] Attempting initial render test...")
+                         try:
+                             frame = env.render()
+                             if frame is not None and isinstance(frame, np.ndarray):
+                                 print(f"[{idx}] Initial render successful! Frame shape: {frame.shape}, dtype: {frame.dtype}")
+                             elif frame is None:
+                                  print(f"[{idx}] Initial render returned None.")
+                             else:
+                                  print(f"[{idx}] Initial render returned unexpected type: {type(frame)}")
+                         except Exception as e:
+                             print(f"[{idx}] ERROR during initial render test: {e}")
+                             import traceback
+                             traceback.print_exc() # Print detailed traceback
+                    # === END DEBUG RENDER TEST ===
+            
+            
+                    # RecordEpisodeStatistics must be applied BEFORE the W&B wrapper
+                    env = gym.wrappers.RecordEpisodeStatistics(env)
+            
+                    # Apply other wrappers
                     env = gym.wrappers.FlattenObservation(env)
                     env = gym.wrappers.ClipAction(env)
                     env = gym.wrappers.NormalizeObservation(env)
-                    env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-                    # Normalizing rewards might not be standard during eval, but keep consistent if needed
+            
+                    current_obs_space = env.observation_space
+                    assert isinstance(current_obs_space, gym.spaces.Box), \
+                        f"Expected Box space after NormalizeObservation, got {type(current_obs_space)}"
+                    clip_low = -10.0
+                    clip_high = 10.0
+                    low = np.full(current_obs_space.shape, clip_low, dtype=current_obs_space.dtype)
+                    high = np.full(current_obs_space.shape, clip_high, dtype=current_obs_space.dtype)
+                    new_obs_space = gym.spaces.Box(
+                        low=low,
+                        high=high,
+                        shape=current_obs_space.shape,
+                        dtype=current_obs_space.dtype
+                    )
+                    env = gym.wrappers.TransformObservation(
+                        env,
+                        lambda obs: np.clip(obs, clip_low, clip_high),
+                        observation_space=new_obs_space
+                    )
+            
                     env = gym.wrappers.NormalizeReward(env, gamma=gamma)
                     env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+            
+                    print(f"[{idx}] Environment creation complete.") # Debug print
                     return env
-                 return thunk
+            
+                return thunk
 
             episodic_returns = evaluate(
                 model_path,
