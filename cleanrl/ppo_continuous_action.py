@@ -99,55 +99,82 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-# === MODIFIED make_env function ===
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
-        # Set render_mode to 'rgb_array' if capture_video is True for wandb
+        # Set render_mode to 'rgb_array' if capture_video is True
         render_mode = "rgb_array" if capture_video else None
+        print(f"[{idx}] Creating env {env_id} with render_mode='{render_mode}'") # Debug print
         env = gym.make(env_id, render_mode=render_mode)
 
-        # RecordEpisodeStatistics must be applied BEFORE the W&B wrapper
+        # === START DEBUG RENDER TEST ===
+        if render_mode == "rgb_array" and idx == 0: # Only test for the env that should capture video
+             print(f"[{idx}] Attempting initial render test...")
+             try:
+                 # For Gymnasium v0.26+, render() returns the frame directly for rgb_array
+                 frame = env.render()
+                 if frame is not None and isinstance(frame, np.ndarray):
+                     print(f"[{idx}] Initial render successful! Frame shape: {frame.shape}, dtype: {frame.dtype}")
+                 elif frame is None:
+                      # In some older gym/mujoco versions, render might return None and update an internal viewer
+                      # but for rgb_array it *should* return the array. This is likely an issue.
+                      print(f"[{idx}] Initial render returned None. This indicates a potential rendering problem for rgb_array.")
+                 else:
+                      print(f"[{idx}] Initial render returned unexpected type: {type(frame)}")
+             except Exception as e:
+                 print(f"[{idx}] ERROR during initial render test: {e}")
+                 import traceback
+                 traceback.print_exc() # Print detailed traceback for rendering errors
+                 # Consider exiting if render fails fundamentally
+                 # raise e # Optional: Stop execution if rendering fails
+        # === END DEBUG RENDER TEST ===
+
+
+        # === RE-ENABLE RecordVideo (if capture_video is True) ===
+        # Keep this enabled for testing direct recording
+        if capture_video and idx == 0:
+             video_folder = f"videos/{run_name}"
+             print(f"[{idx}] Wrapping with RecordVideo, saving to: {video_folder}")
+             os.makedirs(video_folder, exist_ok=True)
+             env = gym.wrappers.RecordVideo(
+                 env,
+                 video_folder=video_folder,
+                 # episode_trigger=lambda x: x % 1 == 0 # Record every episode (or default first)
+                 name_prefix=f"{env_id}-ep"
+             )
+        # === END RecordVideo ===
+
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        # Apply other wrappers
+        # --- Make sure the rest of your wrappers are here ---
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env) # Normalizes obs (often to unit variance)
+        env = gym.wrappers.NormalizeObservation(env)
 
-        # --- START FIX ---
-        # Define the new observation space *after* clipping.
-        # We assume NormalizeObservation results in a Box space.
         current_obs_space = env.observation_space
         assert isinstance(current_obs_space, gym.spaces.Box), \
             f"Expected Box space after NormalizeObservation, got {type(current_obs_space)}"
-
-        # Create bounds matching the np.clip values
         clip_low = -10.0
         clip_high = 10.0
         low = np.full(current_obs_space.shape, clip_low, dtype=current_obs_space.dtype)
         high = np.full(current_obs_space.shape, clip_high, dtype=current_obs_space.dtype)
-
-        # Create the new observation space description
         new_obs_space = gym.spaces.Box(
             low=low,
             high=high,
             shape=current_obs_space.shape,
             dtype=current_obs_space.dtype
         )
-
-        # Apply the TransformObservation wrapper WITH the new observation_space
         env = gym.wrappers.TransformObservation(
             env,
             lambda obs: np.clip(obs, clip_low, clip_high),
-            observation_space=new_obs_space  # Provide the explicit new space
+            observation_space=new_obs_space
         )
-        # --- END FIX ---
 
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        # --- End of wrappers ---
 
-        # The W&B wrapper (WandbGymMonitor) will be implicitly added around this
-        # returned env when monitor_gym=True in wandb.init()
+        print(f"[{idx}] Environment creation complete.") # Debug print
         return env
 
     return thunk
