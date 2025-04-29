@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from optim.sgd import AlphaGrad
 import tyro
+import glob
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
@@ -91,24 +92,36 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
+        env = None # Initialize env variable
+        # Create the environment, enabling rgb_array render mode if capturing video for the first env
         if capture_video and idx == 0:
+            print(f"Setting up environment {idx} for video capture (render_mode='rgb_array')")
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            # Apply the RecordVideo wrapper here, BEFORE other wrappers if possible
+            # Videos will be saved in videos/{run_name}/
+            # Default behavior records until env.close() is called.
+            video_folder = f"videos/{run_name}"
+            print(f"Recording video for env {idx} to {video_folder}")
+            env = gym.wrappers.RecordVideo(env, video_folder=video_folder,
+                                          # Optional: Trigger recording based on episode number
+                                          # episode_trigger=lambda x: x % 50 == 0 # e.g., record every 50 episodes
+                                          )
         else:
             env = gym.make(env_id)
+
+        # Apply common wrappers AFTER potential RecordVideo
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env) # Records episode stats like return and length
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(
             env,
             lambda obs: np.clip(obs, -10, 10),
-            observation_space=env.observation_space
+            observation_space=env.observation_space # Deprecated? Gymnasium might handle this automatically
         )
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
-
     return thunk
 
 
@@ -165,7 +178,7 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
+            monitor_gym=False,
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -364,4 +377,43 @@ if __name__ == "__main__":
             push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
-    writer.close()
+    # --- Manual Video Upload Logic ---
+    # Check if tracking AND video capture were enabled during training
+    if args.track and args.capture_video:
+        print("Attempting to upload recorded videos to W&B...")
+        video_dir = f"videos/{run_name}" # Directory where make_env saved videos
+        print(f"Searching for videos in: {video_dir}")
+        try:
+            # Find all mp4 files, sorted by modification time (newest last)
+            video_files = sorted(glob.glob(os.path.join(video_dir, "*.mp4")), key=os.path.getmtime)
+
+            if video_files:
+                print(f"Found {len(video_files)} video file(s). Uploading...")
+                # Log each video with a unique key, associating with the final global_step
+                for i, video_file in enumerate(video_files):
+                    wandb_key = f"media/video_capture_{i}" # Unique key: media/video_capture_0, ..._1 etc.
+                    print(f" - Logging {video_file} as {wandb_key}")
+                    wandb.log({wandb_key: wandb.Video(video_file, fps=4, format="mp4")}, step=global_step)
+                print("Video upload attempt complete.")
+            else:
+                print(f"Warning: No .mp4 video files found in {video_dir}. Video capture might have failed or completed no episodes.")
+
+        except FileNotFoundError:
+            print(f"Warning: Video directory '{video_dir}' not found. Cannot upload videos.")
+        except Exception as e:
+             print(f"Error during video search or W&B upload: {e}")
+    elif args.capture_video:
+         print("Info: Video capture was enabled but W&B tracking is off. Videos saved locally only.")
+    # --- End Video Upload Logic ---
+
+
+    # --- Final Cleanup ---
+    writer.close() # Close Tensorboard SummaryWriter
+
+    # Finish wandb run if tracking was enabled
+    if args.track:
+         print("Finishing W&B run...")
+         wandb.finish()
+         print("W&B run finished.")
+
+    print("Script execution finished.")
