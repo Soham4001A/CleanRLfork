@@ -99,54 +99,32 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
+# In make_env function:
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
-        # Set render_mode to 'rgb_array' if capture_video is True
         render_mode = "rgb_array" if capture_video else None
-        print(f"[{idx}] Creating env {env_id} with render_mode='{render_mode}'") # Debug print
+        print(f"[{idx}] Creating env {env_id} with render_mode='{render_mode}'")
         env = gym.make(env_id, render_mode=render_mode)
 
-        # === START DEBUG RENDER TEST ===
-        if render_mode == "rgb_array" and idx == 0: # Only test for the env that should capture video
-             print(f"[{idx}] Attempting initial render test...")
-             try:
-                 # For Gymnasium v0.26+, render() returns the frame directly for rgb_array
-                 frame = env.render()
-                 if frame is not None and isinstance(frame, np.ndarray):
-                     print(f"[{idx}] Initial render successful! Frame shape: {frame.shape}, dtype: {frame.dtype}")
-                 elif frame is None:
-                      # In some older gym/mujoco versions, render might return None and update an internal viewer
-                      # but for rgb_array it *should* return the array. This is likely an issue.
-                      print(f"[{idx}] Initial render returned None. This indicates a potential rendering problem for rgb_array.")
-                 else:
-                      print(f"[{idx}] Initial render returned unexpected type: {type(frame)}")
-             except Exception as e:
-                 print(f"[{idx}] ERROR during initial render test: {e}")
-                 import traceback
-                 traceback.print_exc() # Print detailed traceback for rendering errors
-                 # Consider exiting if render fails fundamentally
-                 # raise e # Optional: Stop execution if rendering fails
-        # === END DEBUG RENDER TEST ===
-
-
         # === RE-ENABLE RecordVideo (if capture_video is True) ===
-        # Keep this enabled for testing direct recording
         if capture_video and idx == 0:
-             video_folder = f"videos/{run_name}"
-             print(f"[{idx}] Wrapping with RecordVideo, saving to: {video_folder}")
-             os.makedirs(video_folder, exist_ok=True)
-             env = gym.wrappers.RecordVideo(
-                 env,
-                 video_folder=video_folder,
-                 # episode_trigger=lambda x: x % 1 == 0 # Record every episode (or default first)
-                 name_prefix=f"{env_id}-ep"
-             )
+            video_folder = f"videos/{run_name}"
+            print(f"[{idx}] Wrapping with RecordVideo, saving to: {video_folder}")
+            os.makedirs(video_folder, exist_ok=True)
+            env = gym.wrappers.RecordVideo(
+                env,
+                video_folder=video_folder,
+                name_prefix=f"{env_id}-ep"
+            )
+            # Add the 'enabled' attribute manually AFTER creating the wrapper
+            setattr(env, 'enabled', True) # <--- ADD THIS LINE
         # === END RecordVideo ===
 
+        # REMOVED Initial Render Test
 
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        # --- Make sure the rest of your wrappers are here ---
+        # --- Wrappers ---
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -174,7 +152,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         # --- End of wrappers ---
 
-        print(f"[{idx}] Environment creation complete.") # Debug print
+        print(f"[{idx}] Environment creation complete.")
         return env
 
     return thunk
