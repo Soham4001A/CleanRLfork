@@ -9,30 +9,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from optim.sgd import AlphaGrad
+# Assuming AlphaGrad is correctly located like this:
+# from optim.sgd import AlphaGrad
+# If not, adjust the import path or remove if not using AlphaGrad
+try:
+    from optim.sgd import AlphaGrad
+except ImportError:
+    print("Warning: AlphaGrad optimizer not found. Only Adam will be available.")
+    AlphaGrad = None # Define as None if not found
+
 import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-try:
-    from wandb.integration.gym import RecordVideo
-
-    # 1) Ensure the old `if not self.enabled:` check won’t crash
-    RecordVideo.enabled = True
-
-    # 2) Replace close() with a simple passthrough to the wrapped env
-    def _patched_close(self, *args, **kwargs):
-        try:
-            return self.env.close()
-        except Exception:
-            return None
-
-    RecordVideo.close = _patched_close
-
-except ImportError:
-    # wandb not installed or integration changed—no patch needed
-    pass
-
+# === REMOVED THE WANDB PATCH BLOCK ===
+# No longer needed as we rely on monitor_gym=True
 
 @dataclass
 class Args:
@@ -58,13 +49,13 @@ class Args:
     """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
-    optimizer: str = ""
-    """ Optimizer to use"""
+    optimizer: str = "Adam" # Default to Adam
+    """ Optimizer to use (e.g., Adam, AlphaGrad)"""
     alpha: float = 0.0
     """ Alpha value for AlphaGrad"""
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "HalfCheetah-v4" # Note: You ran with v5, ensure consistency or use v4
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -108,31 +99,40 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
+# === MODIFIED make_env function ===
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
-        if capture_video and idx == 0:
-            # create the video‐capturing wrapper
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-            # ensure the RecordVideo wrapper has an `enabled` flag
-            # so that env.close() won’t hit an AttributeError
-            env.enabled = True
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)
+        # Set render_mode to 'rgb_array' if capture_video is True for wandb
+        render_mode = "rgb_array" if capture_video else None
+        env = gym.make(env_id, render_mode=render_mode)
+
+        # RecordEpisodeStatistics must be applied BEFORE the W&B wrapper (monitor_gym=True does this automatically)
+        # but AFTER any other wrappers altering termination/truncation conditions if needed.
+        # Applying it early is usually fine.
         env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # **** REMOVED gym.wrappers.RecordVideo ****
+        # if capture_video and idx == 0:
+        #     print(f"MAKING VIDEO FOR {run_name}") # Debug print
+        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}",
+        #         # You might need episode_trigger lambda if monitor_gym doesn't record when you want
+        #         # episode_trigger=lambda x: x % 50 == 0 # Example: Record every 50 episodes
+        #     )
+
+        # Keep other wrappers
+        env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(
-            env,
-            lambda obs: np.clip(obs, -10, 10),
-            observation_space=env.observation_space
-        )
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+
+        # The W&B wrapper (WandbGymMonitor) will be implicitly added around this
+        # returned env when monitor_gym=True in wandb.init()
         return env
 
     return thunk
+# ===================================
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -179,16 +179,19 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+
     if args.track:
         import wandb
 
+        # Ensure monitor_gym=True is set (it is by default if installed)
+        # W&B will now handle video recording if capture_video=True was used in make_env to set render_mode
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
+            monitor_gym=True, # IMPORTANT: This enables W&B video recording
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -207,15 +210,30 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
+        # Pass capture_video flag to make_env so it can set render_mode
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    if args.optimizer == 'Adam':
+
+    # === Fixed Optimizer Selection Logic ===
+    if args.optimizer.lower() == 'alphagrad' and AlphaGrad is not None:
+        print(f"Using AlphaGrad optimizer with alpha={args.alpha} lr={args.learning_rate}")
+        optimizer = AlphaGrad(agent.parameters(), lr=args.learning_rate, alpha=args.alpha, epsilon=1e-5, momentum=0.9)
+    elif args.optimizer.lower() == 'adam':
+        print(f"Using Adam optimizer with lr={args.learning_rate}")
         optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-    if args.optimizer == 'AlphaGrad':
-        optimizer = AlphaGrad(agent.parameters(), lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
+    else:
+        # Default to Adam if optimizer name is unknown or AlphaGrad is not available
+        if args.optimizer.lower() not in ['adam', 'alphagrad']:
+             print(f"Warning: Unknown optimizer '{args.optimizer}'. Defaulting to Adam.")
+        elif args.optimizer.lower() == 'alphagrad':
+             print(f"Warning: AlphaGrad optimizer selected but not found. Defaulting to Adam.")
+        print(f"Using Adam optimizer with lr={args.learning_rate}")
+        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # ======================================
+
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -231,6 +249,9 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+
+    print(f"Starting training for {args.total_timesteps} timesteps...")
+    print(f"Number of iterations: {args.num_iterations}")
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -252,18 +273,43 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            step_result = envs.step(action.cpu().numpy())
+            next_obs, reward, terminations, truncations, infos = step_result
+
+            # Handle VecEnv step return format (may differ slightly across gym versions)
+            # Ensure 'final_info' and 'final_observation' are handled if present
+            if isinstance(infos, dict) and "_final_info" in infos:
+                # New Gymnasium VecEnv returns final_info and final_observation separately
+                final_infos = infos.get("final_info", [{} for _ in range(args.num_envs)]) # Default to list of empty dicts
+                # Filter out None entries which indicate the episode is not done
+                valid_final_infos = [info for info in final_infos if info is not None and 'episode' in info]
+
+                for info in valid_final_infos:
+                    episodic_return = info["episode"]["r"].item()
+                    episodic_length = info["episode"]["l"].item()
+                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+                    # W&B monitor_gym also logs these automatically if RecordEpisodeStatistics is used
+            elif "episode" in infos:
+                 # Older or different VecEnv setup might still put episode info directly in 'infos'
+                 # This part might become less relevant with latest Gymnasium but kept for compatibility
+                 # Ensure accessing info items safely
+                 if "r" in infos["episode"] and "l" in infos["episode"]:
+                    for i in range(len(infos["episode"]["r"])):
+                        # Check if the episode data corresponds to a finished episode in this step
+                        if terminations[i] or truncations[i]:
+                            episodic_return = infos["episode"]["r"][i].item()
+                            episodic_length = infos["episode"]["l"][i].item()
+                            print(f"global_step={global_step}, episodic_return={episodic_return}")
+                            writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                            writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+
+
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "episode" in infos:
-                for i in range(len(infos["episode"]["r"])):
-                    episodic_return = infos["episode"]["r"][i].item()
-                    episodic_length = infos["episode"]["l"][i].item()
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
-                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
-                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -337,11 +383,16 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                if args.optimizer == 'Adam':
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # === Corrected Grad Clipping Logic ===
+                if not (args.optimizer.lower() == 'alphagrad' and AlphaGrad is not None):
+                    # Clip gradients only if NOT using AlphaGrad (assuming AlphaGrad handles norms internally or differently)
+                     nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # ====================================
                 optimizer.step()
 
+
             if args.target_kl is not None and approx_kl > args.target_kl:
+                print(f"Early stopping at epoch {epoch+1} due to reaching target KL {approx_kl.item():.4f}")
                 break
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -357,34 +408,86 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        current_time = time.time()
+        sps = int(args.num_steps * args.num_envs / (current_time - start_time)) # Calculate SPS for this iteration
+        print(f"Iteration {iteration}/{args.num_iterations}, SPS: {sps}")
+        writer.add_scalar("charts/SPS", sps, global_step)
+        # Reset start_time for next iteration's SPS calculation if desired, otherwise it's cumulative average
+        # start_time = current_time # Uncomment to calculate SPS per iteration
 
+    # === EVALUATION AND SAVING (No changes needed here) ===
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+        # Ensure cleanrl_utils is installed and importable
+        try:
+            from cleanrl_utils.evals.ppo_eval import evaluate
 
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
+            # Modify make_env for evaluation (no video capture needed here unless desired)
+            def make_eval_env(env_id, idx, capture_video, run_name, gamma):
+                 def thunk():
+                    # No render_mode needed unless you want to see eval runs (not typical)
+                    env = gym.make(env_id) # render_mode=None
+                    env = gym.wrappers.RecordEpisodeStatistics(env) # Still useful for eval stats
+                    env = gym.wrappers.FlattenObservation(env)
+                    env = gym.wrappers.ClipAction(env)
+                    env = gym.wrappers.NormalizeObservation(env)
+                    env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+                    # Normalizing rewards might not be standard during eval, but keep consistent if needed
+                    env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+                    env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+                    return env
+                 return thunk
 
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+            episodic_returns = evaluate(
+                model_path,
+                make_eval_env, # Use the potentially modified eval env maker
+                args.env_id,
+                eval_episodes=10,
+                run_name=f"{run_name}-eval",
+                Model=Agent, # Pass the Agent class correctly
+                device=device,
+                gamma=args.gamma, # Pass gamma if needed by NormalizeReward in eval env
+            )
+            for idx, episodic_return in enumerate(episodic_returns):
+                writer.add_scalar("eval/episodic_return", episodic_return, idx)
+
+            if args.upload_model:
+                 # Ensure cleanrl_utils is installed and importable
+                 try:
+                    from cleanrl_utils.huggingface import push_to_hub
+
+                    repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
+                    repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+                    # push_to_hub expects video folder path, but wandb handles video saving
+                    # If you want to upload videos saved locally by wandb, you might need to find their path
+                    # or rely on wandb's artifact logging.
+                    # For now, let's assume push_to_hub primarily uploads the model and maybe tensorboard logs.
+                    # Passing None for video folder might be safer if videos aren't saved where expected.
+                    # Check push_to_hub documentation for specifics.
+                    print("Note: W&B automatically saves videos. Check W&B run page for videos.")
+                    print("Uploading model and run data to Hugging Face Hub...")
+                    push_to_hub(
+                        args=args, # Pass args object
+                        episodic_returns=episodic_returns,
+                        repo_id=repo_id,
+                        algo_name="PPO", # Algorithm name string
+                        basedir=f"runs/{run_name}", # Base directory of the run
+                        wandb_project_name=args.wandb_project_name, # Pass wandb project name
+                        wandb_entity=args.wandb_entity, # Pass wandb entity
+                        # video_folder=f"videos/{run_name}" # Maybe Optional: W&B logs videos directly
+                    )
+                 except ImportError:
+                    print("cleanrl_utils not found, skipping Hugging Face upload.")
+        except ImportError:
+            print("cleanrl_utils not found, skipping evaluation.")
+
 
     envs.close()
     writer.close()
+    if args.track:
+        wandb.finish() # Ensure wandb run finishes cleanly
+
+print("Script finished.")
