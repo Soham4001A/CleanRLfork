@@ -118,6 +118,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             )
             # Add the 'enabled' attribute manually AFTER creating the wrapper
             setattr(env, 'enabled', True) # <--- ADD THIS LINE
+            setattr(env, 'path', video_folder) # <--- ADD THIS LINE (or maybe '')
         # === END RecordVideo ===
 
         # REMOVED Initial Render Test
@@ -554,9 +555,26 @@ if __name__ == "__main__":
             print("cleanrl_utils not found, skipping evaluation.")
 
 
-    envs.close()
+    if args.track and args.capture_video:
+        # Construct the likely path to the generated video file
+        # Note: RecordVideo might save multiple files if multiple episodes finish
+        # We'll try and find the first .mp4 file
+        video_dir = f"videos/{run_name}"
+        video_files = [f for f in os.listdir(video_dir) if f.endswith(".mp4")]
+        if video_files:
+            video_path = os.path.join(video_dir, sorted(video_files)[0]) # Log the first video
+            print(f"Logging video to W&B: {video_path}")
+            try:
+                 wandb.log({"video": wandb.Video(video_path, fps=4, format="mp4")})
+            except Exception as e:
+                 print(f"Error logging video to W&B: {e}")
+        else:
+             print(f"Could not find video file in {video_dir} to log to W&B.")
+    
+    
+    envs.close() # This might still crash if the path/enabled fix doesn't work
     writer.close()
     if args.track:
-        wandb.finish() # Ensure wandb run finishes cleanly
+        wandb.finish()
 
 print("Script finished.")
