@@ -1,4 +1,11 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
+
+# This currently manually saves the videos and uploads them to wand
+# Command line to reproduce results - 
+
+# NOTE -> make sure you have the correct versions of the requirements installed from the initial runs -> for some reason, PPO is super finicky and can absolutely mess up over updates
+
+
 import os
 import random
 import time
@@ -9,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from optim.sgd import AlphaGrad
+from optim.sgd import AlphaGrad, DAG
 import tyro
 import glob
 from torch.distributions.normal import Normal
@@ -206,6 +213,8 @@ if __name__ == "__main__":
         optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     if args.optimizer == 'AlphaGrad':
         optimizer = AlphaGrad(agent.parameters(), lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
+    if args.optimizer == 'DAG':
+        optimizer = DAG(agent.parameters(), lr=args.learning_rate, momentum = 0.9)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -327,8 +336,8 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                if args.optimizer == 'Adam':
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # if args.optimizer == 'Adam':
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
