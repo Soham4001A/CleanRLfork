@@ -1,10 +1,9 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 
 # This currently manually saves the videos and uploads them to wand
-# Command line to reproduce results - 
+# Command line to reproduce results - xvfb-run -a -s "-screen 0 1400x900x24" python ppo_continuous_action.py --env-id HalfCheetah-v5 --optimizer DAG --learning_rate 9E-5 --capture_video --track
 
 # NOTE -> make sure you have the correct versions of the requirements installed from the initial runs -> for some reason, PPO is super finicky and can absolutely mess up over updates
-
 
 import os
 import random
