@@ -265,96 +265,112 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            returns = advantages + values
-
-        # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
-
-        # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+            # NOTE: Assumes 'rewards', 'dones', 'values' below are the DynAGO buffers
+            # (rewards_buffer, dones_buffer, values_buffer) with shape (num_total_samples, num_envs)
+            
+            # Calculate Monte Carlo returns G_t
+            returns = torch.zeros_like(rewards_buffer).to(device) # Will store G_t for each sample
+            mc_return_from_here = torch.zeros(args.num_envs).to(device) # Accumulator for return from t+1 onwards
+        
+            # Iterate backwards through ALL collected samples in the rollout buffer
+            for t in reversed(range(args.num_total_samples_per_rollout)):
+                # Get the modulated reward for this step
+                current_rewards = rewards_buffer[t] # r_mod_tj
+                
+                # Calculate G_t = r_t + gamma * G_{t+1} * (1 - d_t)
+                # 'mc_return_from_here' holds G_{t+1} (return from step t+1 onwards)
+                # dones_buffer[t] determines if the episode ended *after* this step t
+                returns[t] = current_rewards + args.gamma * mc_return_from_here * (1.0 - dones_buffer[t])
+                
+                # Update the accumulator for the next iteration (t-1). This becomes G_t.
+                mc_return_from_here = returns[t] 
+        
+            # Use the calculated Monte Carlo returns (G_t) as the advantage signal
+            # No separate advantage calculation needed when baseline is effectively zero.
+            advantages = returns # Shape: (num_total_samples, num_envs)
+        
+        # Flatten the batch - uses the correct total batch size based on DynAGO buffers
+        # Ensure obs_buffer, logprobs_buffer, actions_buffer also have num_total_samples_per_rollout in first dim
+        b_obs = obs_buffer.reshape((-1,) + obs_shape) # Use DynAGO's obs_buffer
+        b_logprobs = logprobs_buffer.reshape(-1)       # Use DynAGO's logprobs_buffer
+        b_actions = actions_buffer.reshape((-1,) + action_shape) # Use DynAGO's actions_buffer
+        b_advantages = advantages.reshape(-1)         # These are now G_t
+        b_returns = returns.reshape(-1)               # Also G_t, target for value loss (but vf_coef=0)
+        b_values = values_buffer.reshape(-1)          # V(s_t) from buffer, used for value loss calculation (but result ignored)
+        
+        # Optimizing the policy network (Value network loss is disabled by vf_coef=0)
+        b_inds = np.arange(args.batch_size) # Should be num_envs * num_total_samples_per_rollout
         clipfracs = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
+        
+                # We only need policy outputs: newlogprob, entropy
+                # newvalue is computed but not used in the final loss calculation if vf_coef=0
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
-
+        
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-                mb_advantages = b_advantages[mb_inds]
+        
+                mb_advantages = b_advantages[mb_inds] # This is G_t for the minibatch
                 if args.norm_adv:
+                    # Normalizing MC returns can sometimes help stabilize REINFORCE
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
+        
+                # Policy loss using G_t (or normalized G_t) as advantage
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
+        
+                # Value loss calculation (will be multiplied by vf_coef=0)
+                # We still compute it to avoid errors if parts of the code expect v_loss variable
+                v_loss_calc = torch.tensor(0.0, device=device) # Default if not clipped
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
+                    # Need b_values (V(s_t) prediction) for clipping calculation
+                    v_clipped = b_values[mb_inds] + torch.clamp( 
+                        newvalue - b_values[mb_inds], -args.clip_coef, args.clip_coef,
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
+                    v_loss_calc = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
+                    v_loss_calc = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+        
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
+                # Total loss: policy loss + entropy bonus (value loss term is zeroed out by vf_coef)
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss_calc * args.vf_coef 
+        
                 optimizer.zero_grad()
-                loss.backward()
-                # if args.optimizer == 'Adam':
+                loss.backward() # Gradients only computed for policy network (and shared layers if any)
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
-
+        
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
-
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        
+        # Logging Update
+        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy() # y_pred=V(s_t), y_true=G_t
         var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        # Explained variance is not meaningful as V(s_t) wasn't trained against G_t
+        explained_var = np.nan 
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        # writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        # writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 

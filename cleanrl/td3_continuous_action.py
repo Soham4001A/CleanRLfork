@@ -14,7 +14,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
-from optim.sgd import AlphaGrad
+from optim.sgd import DAG
 
 
 @dataclass
@@ -193,9 +193,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     if args.optimizer == "Adam":
         q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
         actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
-    if args.optimizer == 'AlphaGrad':
-        q_optimizer = AlphaGrad(list(qf1.parameters()) + list(qf2.parameters()),  lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
-        actor_optimizer = AlphaGrad(list(actor.parameters()),  lr=args.learning_rate, alpha = args.alpha, epsilon=1e-5, momentum = 0.9)
+    if args.optimizer == 'DAG':
+        q_optimizer = DAG(list(qf1.parameters()) + list(qf2.parameters()),  lr=args.learning_rate, momentum = 0.9)
+        actor_optimizer = DAG(list(actor.parameters()),  lr=args.learning_rate, momentum = 0.9)
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(

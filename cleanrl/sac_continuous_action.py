@@ -12,7 +12,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
+from gymnasium.wrappers import TransformObservation
 from torch.utils.tensorboard import SummaryWriter
+from optim.sgd import DAG
 
 
 @dataclass
@@ -63,19 +65,38 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    optimizer: str = ""
 
+
+
+class CastObs32(gym.ObservationWrapper):
+    """Convert observations to np.float32 and update the space dtype."""
+    def __init__(self, env):
+        super().__init__(env)
+        # build a new Box with the same bounds but dtype float32
+        old_space = env.observation_space
+        self.observation_space = gym.spaces.Box(
+            low=old_space.low.astype(np.float32),
+            high=old_space.high.astype(np.float32),
+            shape=old_space.shape,
+            dtype=np.float32,
+        )
+
+    def observation(self, obs):
+        return obs.astype(np.float32, copy=False)
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
+        env = gym.make(env_id, render_mode="rgb_array") if (capture_video and idx == 0) else gym.make(env_id)
+        env = gym.wrappers.RecordVideo(env, f"videos/{run_name}") if (capture_video and idx == 0) else env
         env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # --- cast observations to float32 ---
+        env = CastObs32(env)
+        # ------------------------------------
+
         env.action_space.seed(seed)
         return env
-
     return thunk
 
 
@@ -203,8 +224,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    if args.optimizer == "Adam":
+        q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+        actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    if args.optimizer == "DAG":
+        q_optimizer = DAG(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+        actor_optimizer = DAG(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -248,13 +273,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                     break
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # TRY NOT TO MODIFY: save data to replay buffer; handle final/terminal observations
         real_next_obs = next_obs.copy()
+        
+        # Gymnasium ≥0.29 ➜ "final_observation"
+        # Gymnasium ≤0.28 ➜ "terminal_observation"
+        obs_key = None
+        if "final_observation" in infos:
+            obs_key = "final_observation"
+        elif "terminal_observation" in infos:
+            obs_key = "terminal_observation"
+        
         for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+            # overwrite only for envs that actually ended this step
+            if trunc and obs_key is not None:
+                real_next_obs[idx] = infos[obs_key][idx]
+        
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-
+        
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
