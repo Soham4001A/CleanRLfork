@@ -149,12 +149,20 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         env = None
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            if env_id == "f16_intercept":
+                from f16env import F16InterceptEnv
+                env = F16InterceptEnv()
+            else:
+                env = gym.make(env_id, render_mode="rgb_array")
             video_folder = f"videos/{run_name}"
             os.makedirs(video_folder, exist_ok=True)
             env = gym.wrappers.RecordVideo(env, video_folder=video_folder)
         else:
-            env = gym.make(env_id)
+            if env_id == "f16_intercept":
+                from f16env import F16InterceptEnv
+                env = F16InterceptEnv()
+            else:
+                env = gym.make(env_id)
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
