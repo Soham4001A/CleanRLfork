@@ -359,14 +359,30 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward, device=device, dtype=torch.float32)
             next_obs = torch.tensor(next_obs_np, device=device, dtype=torch.float32)
 
-            if "episode" in infos:
-                # gym.vector Normalize wrappers often put aggregated episode stats here
-                for i in range(len(infos["episode"]["r"])):
-                    episodic_return = infos["episode"]["r"][i].item()
-                    episodic_length = infos["episode"]["l"][i].item()
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
-                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
-                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            # --- episodic logging (robust for Gymnasium vector APIs) ---
+            # First: Gymnasium vectorized path (episode info in infos["final_info"])
+            if "final_info" in infos and infos["final_info"] is not None:
+                for finfo in infos["final_info"]:
+                    if finfo and "episode" in finfo:
+                        ep_r = finfo["episode"]["r"]
+                        ep_l = finfo["episode"]["l"]
+                        # ep_r/ep_l may be numpy scalars
+                        ep_r = float(ep_r) if hasattr(ep_r, "item") else ep_r
+                        ep_l = float(ep_l) if hasattr(ep_l, "item") else ep_l
+                        print(f"global_step={global_step}, episodic_return={ep_r}")
+                        writer.add_scalar("charts/episodic_return", ep_r, global_step)
+                        writer.add_scalar("charts/episodic_length", ep_l, global_step)
+            
+            # Fallback: older/alternate path (episode info directly in infos)
+            elif "episode" in infos:
+                rs = infos["episode"].get("r", [])
+                ls = infos["episode"].get("l", [])
+                for i in range(len(rs)):
+                    ep_r = float(rs[i]) if hasattr(rs[i], "item") else rs[i]
+                    ep_l = float(ls[i]) if hasattr(ls[i], "item") else ls[i]
+                    print(f"global_step={global_step}, episodic_return={ep_r}")
+                    writer.add_scalar("charts/episodic_return", ep_r, global_step)
+                    writer.add_scalar("charts/episodic_length", ep_l, global_step)
 
         # Bootstrap & GAE on realized branch
         with torch.no_grad():
