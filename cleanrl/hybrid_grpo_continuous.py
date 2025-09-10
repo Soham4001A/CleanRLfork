@@ -1,11 +1,11 @@
 # Hybrid GRPO (True Node Sampling) for Continuous Actions – CleanRL-style
-# Behavior:
-# - Sample K actions, probe one-step rewards on base env (env.unwrapped), then restore
-# - Tanh-normalize per-step rewards across K -> per-sample policy advantages
-# - Advance real env only with the best (argmax reward) action
-# - Value loss ONLY on realized branch (standard GAE on executed trajectory)
+# Shadow-env probing: probe on synchronized shadow envs (same wrappers) to avoid perturbing rollout envs.
+# - Sample K actions, probe one-step rewards on per-env SHADOW (wrapped) env, restoring inside shadow.
+# - Tanh-normalize per-step rewards across K -> per-sample policy advantages (no second normalization).
+# - Advance real env only with the chosen action (argmax or softmax over standardized rewards).
+# - Value loss ONLY on realized branch (standard GAE).
 #
-# Logging keys match your PPO continuous script (no extras) for apples-to-apples comparison.
+# Logging keys match PPO continuous (no extras).
 
 import os
 import random
@@ -22,7 +22,7 @@ import glob
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-# Optional: your custom optimizers (kept API compatibility)
+# Optional: custom optimizers
 try:
     from optim.sgd import AlphaGrad, DAG
 except Exception:
@@ -43,7 +43,7 @@ class Args:
     upload_model: bool = False
     hf_entity: str = ""
     optimizer: str = "Adam"   # "Adam" | "AlphaGrad" | "DAG"
-    alpha: float = 0.0        # for AlphaGrad
+    alpha: float = 0.0        # AlphaGrad
 
     # Algo
     env_id: str = "HalfCheetah-v5"
@@ -56,7 +56,7 @@ class Args:
     gae_lambda: float = 0.95
     num_minibatches: int = 32
     update_epochs: int = 10
-    norm_adv: bool = True
+    norm_adv: bool = True           # only applies to realized branch (we do NOT renorm K-sample advantages)
     clip_coef: float = 0.2
     clip_vloss: bool = True
     ent_coef: float = 0.0
@@ -64,10 +64,11 @@ class Args:
     max_grad_norm: float = 0.5
     target_kl: float = None
 
-    # Hybrid GRPO specific
-    num_node_samples: int = 4          # K samples per step
-    tanh_temperature: float = 1.0      # tau
-    eps_norm: float = 1e-8             # epsilon for std normalize across K
+    # Hybrid GRPO specifics
+    num_node_samples: int = 4       # K
+    tanh_temperature: float = 1.0   # tau for tanh(z)
+    eps_norm: float = 1e-8
+    exec_temperature: float = 0.0   # 0 => argmax, >0 => softmax over standardized rewards
 
     # runtime
     batch_size: int = 0
@@ -79,16 +80,15 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            video_folder = f"videos/{run_name}"
-            env = gym.wrappers.RecordVideo(env, video_folder=video_folder)
+            env = gym.wrappers.RecordVideo(env, video_folder=f"videos/{run_name}")
         else:
             env = gym.make(env_id)
 
+        # match your PPO stack
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        # REMOVE the observation_space kwarg (it’s not accepted anymore)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
@@ -137,60 +137,42 @@ class Agent(nn.Module):
         return Normal(mean, std)
 
 
-# ---------- Base-env snapshot/restore for probing (classic Mujoco-friendly) ----------
-def _snapshot_base_env(single_env):
-    """
-    Snapshot base env state & RNG. Works with many classic-control / mujoco Gym envs:
-    - base = single_env.unwrapped
-    - base.np_random.bit_generator.state
-    - base.sim/data getter or 'state' attr if available
-    This keeps it generic: if attributes don't exist, we skip them.
-    """
-    base = single_env.unwrapped
-    snap = {}
+# ---------- Low-level state copy helpers ----------
+def _get_base(env):
+    cur = env
+    while hasattr(cur, "env"):
+        cur = cur.env
+    return cur
 
-    # RNG
+def _snapshot_base_env(base):
+    snap = {}
     if hasattr(base, "np_random") and hasattr(base.np_random, "bit_generator"):
         snap["rng"] = base.np_random.bit_generator.state
-
-    # Common state holders
     if hasattr(base, "state"):
         s = base.state
         snap["state"] = np.array(s, copy=True) if isinstance(s, np.ndarray) else (s.copy() if hasattr(s, "copy") else s)
-
-    # Mujoco-like low-level (best-effort; not all expose)
     for attr in ("qpos", "qvel", "qacc"):
         if hasattr(base, attr):
-            val = getattr(base, attr)
             try:
-                snap[attr] = np.copy(val)
+                snap[attr] = np.copy(getattr(base, attr))
             except Exception:
                 pass
-
-    # Episode bookkeeping seen sometimes
     for attr in ("steps_beyond_terminated", "t"):
         if hasattr(base, attr):
             snap[attr] = getattr(base, attr)
-
     return snap
 
-
-def _restore_base_env(single_env, snap):
-    base = single_env.unwrapped
-
+def _restore_base_env(base, snap):
     if "rng" in snap and hasattr(base, "np_random") and hasattr(base.np_random, "bit_generator"):
         base.np_random.bit_generator.state = snap["rng"]
-
     if "state" in snap and hasattr(base, "state"):
         base.state = np.array(snap["state"], copy=True)
-
     for attr in ("qpos", "qvel", "qacc"):
         if attr in snap and hasattr(base, attr):
             try:
                 getattr(base, attr)[:] = snap[attr]
             except Exception:
                 pass
-
     for k, v in snap.items():
         if k in ("rng", "state", "qpos", "qvel", "qacc"):
             continue
@@ -200,32 +182,81 @@ def _restore_base_env(single_env, snap):
             except Exception:
                 pass
 
+def _copy_rms(dst_rms, src_rms):
+    # Support scalar or array mean/var
+    for name in ("mean", "var"):
+        if hasattr(dst_rms, name) and hasattr(src_rms, name):
+            src_val = getattr(src_rms, name)
+            try:
+                cur = getattr(dst_rms, name)
+                if isinstance(cur, np.ndarray):
+                    np.copyto(cur, np.asarray(src_val))
+                else:
+                    setattr(dst_rms, name, float(src_val) if np.isscalar(src_val) else src_val)
+            except Exception:
+                try:
+                    setattr(dst_rms, name, src_val)
+                except Exception:
+                    pass
+    if hasattr(dst_rms, "count") and hasattr(src_rms, "count"):
+        try:
+            dst_rms.count = float(src_rms.count)
+        except Exception:
+            pass
+
+def _sync_wrappers(dst_env, src_env):
+    """
+    Copy wrapper states (NormalizeObservation/Reward, running return) from src_env (real)
+    to dst_env (shadow), and copy base state/RNG.
+    """
+    # walk chains
+    def walk_chain(env):
+        chain = []
+        cur = env
+        while hasattr(cur, "env"):
+            chain.append(cur)
+            cur = cur.env
+        return chain, cur  # wrappers (outer->inner), base
+    src_chain, src_base = walk_chain(src_env)
+    dst_chain, dst_base = walk_chain(dst_env)
+
+    # copy base state/RNG
+    _restore_base_env(dst_base, _snapshot_base_env(src_base))
+
+    # copy wrapper stats by class name alignment (stack is identical by construction)
+    for w_src, w_dst in zip(src_chain, dst_chain):
+        # NormalizeObservation
+        if hasattr(w_src, "obs_rms") and hasattr(w_dst, "obs_rms"):
+            _copy_rms(w_dst.obs_rms, w_src.obs_rms)
+        # NormalizeReward
+        if hasattr(w_src, "return_rms") and hasattr(w_dst, "return_rms"):
+            _copy_rms(w_dst.return_rms, w_src.return_rms)
+        # running return value
+        if hasattr(w_src, "ret") and hasattr(w_dst, "ret"):
+            try:
+                w_dst.ret = float(w_src.ret)
+            except Exception:
+                pass
 
 def _clip_to_box(action_np, box_space: gym.spaces.Box):
-    low = box_space.low
-    high = box_space.high
-    return np.clip(action_np, low, high)
+    return np.clip(action_np, box_space.low, box_space.high)
 
-
-def _probe_one_step_reward_continuous(single_env, action_np):
+def _probe_one_step_reward_on_shadow(shadow_env, action_np):
     """
-    Probe the base env (env.unwrapped) by one step with a continuous action.
-    - Clips action to Box bounds.
-    - Steps the BASE env, not wrappers, and restores base state afterwards.
-    Returns (reward, done_flag).
+    Probe one step on the SHADOW env (already synchronized to real), then restore shadow snapshot.
     """
-    base = single_env.unwrapped
-    snap = _snapshot_base_env(single_env)
+    # snapshot shadow (base + wrapper stats that mutate on step)
+    base = _get_base(shadow_env)
+    base_snap = _snapshot_base_env(base)
 
-    # Ensure action is clipped to the action space of the wrapped env
-    box = single_env.action_space
-    action_clipped = _clip_to_box(action_np, box)
-    # Step the BASE env directly
-    _, reward, terminated, truncated, _ = base.step(action_clipped)
-    _restore_base_env(single_env, snap)
-    done = bool(terminated or truncated)
-    return float(reward), done
-# -------------------------------------------------------------------------------
+    # step shadow through top-level (wrappers handle clip/norm)
+    action_clipped = _clip_to_box(action_np, shadow_env.action_space)
+    _, r, term, trunc, _ = shadow_env.step(action_clipped)
+
+    # restore shadow base (wrapper rms don't need restore: we re-sync from real every step)
+    _restore_base_env(base, base_snap)
+    return float(r), bool(term or trunc)
+# --------------------------------------------------------------
 
 
 if __name__ == "__main__":
@@ -260,11 +291,17 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # Env setup
+    # Real envs
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+
+    # Shadow probe envs (identical wrapper stack, no video)
+    probe_envs = [make_env(args.env_id, i + 10_000, False, run_name, args.gamma)() for i in range(args.num_envs)]
+    # IMPORTANT: OrderEnforcing requires reset before step
+    for i, penv in enumerate(probe_envs):
+        penv.reset(seed=args.seed + 10_000 + i)
 
     agent = Agent(envs).to(device)
     if args.optimizer == "Adam":
@@ -276,7 +313,7 @@ if __name__ == "__main__":
     else:
         optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Storage (same logging schema as PPO)
+    # Storage (PPO-compatible logging)
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device)
     logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
@@ -284,22 +321,21 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
     values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
-    # Hybrid GRPO buffers for K-sample policy loss
+    # K-sample buffers
     K = args.num_node_samples
     act_dim = int(np.prod(envs.single_action_space.shape))
     all_actions = torch.zeros((args.num_steps, args.num_envs, K, act_dim), device=device)
     all_logprobs = torch.zeros((args.num_steps, args.num_envs, K), device=device)
     all_advantages = torch.zeros((args.num_steps, args.num_envs, K), device=device)
 
-    # Start rollout
+    # Rollout
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.tensor(next_obs, device=device, dtype=torch.float32)
     next_done = torch.zeros(args.num_envs, device=device)
 
-    # Access underlying single envs for probing
-    single_envs = envs.envs
+    real_envs_list = envs.envs  # list of single envs
 
     for iteration in range(1, args.num_iterations + 1):
         if args.anneal_lr:
@@ -312,43 +348,47 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             with torch.no_grad():
-                # Dist for current obs
                 mean, std = agent.dist_params(next_obs)                 # [E, A]
                 dist = Normal(mean, std)
-                # sample K actions: [K, E, A] -> [E, K, A]
-                k_actions = dist.sample((K,)).transpose(0, 1).contiguous()
-                # old logprobs under current policy: log_prob per dim sum(-1)
+                k_actions = dist.sample((K,)).transpose(0, 1).contiguous()  # [E, K, A]
                 k_logprobs = dist.log_prob(k_actions).sum(-1)           # [E, K]
 
-            # PROBE rewards per env/action by stepping base env & restoring
-            k_rewards = np.zeros((args.num_envs, K), dtype=np.float32)
-            # (Optionally, if probe reaches terminal, we still use immediate reward)
+            # --- Synchronize each shadow env to its real env BEFORE probing ---
             for e in range(args.num_envs):
-                env_e = single_envs[e]
+                _sync_wrappers(probe_envs[e], real_envs_list[e])
+
+            # --- Probe rewards on shadow envs (restore shadow base after each probe) ---
+            k_rewards = np.zeros((args.num_envs, K), dtype=np.float32)
+            for e in range(args.num_envs):
+                penv = probe_envs[e]
                 for ki in range(K):
                     a_np = k_actions[e, ki].detach().cpu().numpy()
-                    r_i, _ = _probe_one_step_reward_continuous(env_e, a_np)
+                    r_i, _ = _probe_one_step_reward_on_shadow(penv, a_np)
                     k_rewards[e, ki] = r_i
 
-            # Tanh-normalized per-sample advantages across K
+            # Tanh-normalized advantages across K
             k_rewards_t = torch.tensor(k_rewards, device=device)
             mu = k_rewards_t.mean(dim=1, keepdim=True)
             stdr = k_rewards_t.std(dim=1, keepdim=True)
             z = (k_rewards_t - mu) / (stdr + args.eps_norm)
             adv_k = torch.tanh(args.tanh_temperature * z)               # [E, K]
 
-            # Choose executed action = argmax probed reward
-            best_idx = torch.argmax(k_rewards_t, dim=1)                 # [E]
-            chosen_actions = k_actions[torch.arange(args.num_envs), best_idx]  # [E, A]
-            chosen_logprobs = dist.log_prob(chosen_actions).sum(-1)     # [E]
+            # Choose executed action
+            if args.exec_temperature > 0.0:
+                weights = torch.softmax(z * args.exec_temperature, dim=1)      # [E, K]
+                best_idx = torch.multinomial(weights, num_samples=1).squeeze(1)
+            else:
+                best_idx = torch.argmax(k_rewards_t, dim=1)
+            chosen_actions = k_actions[torch.arange(args.num_envs), best_idx]   # [E, A]
+            chosen_logprobs = dist.log_prob(chosen_actions).sum(-1)             # [E]
             with torch.no_grad():
-                value = agent.get_value(next_obs).squeeze(-1)           # [E]
+                value = agent.get_value(next_obs).squeeze(-1)                   # [E]
 
-            # Store realized branch (PPO buffers)
+            # Store realized branch
             actions[step] = chosen_actions
             logprobs[step] = chosen_logprobs
             values[step] = value
-            rewards[step] = 0.0  # will be filled after env.step
+            rewards[step] = 0.0
             all_actions[step] = k_actions
             all_logprobs[step] = k_logprobs
             all_advantages[step] = adv_k
@@ -359,21 +399,17 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward, device=device, dtype=torch.float32)
             next_obs = torch.tensor(next_obs_np, device=device, dtype=torch.float32)
 
-            # --- episodic logging (robust for Gymnasium vector APIs) ---
-            # First: Gymnasium vectorized path (episode info in infos["final_info"])
+            # episodic logging
             if "final_info" in infos and infos["final_info"] is not None:
                 for finfo in infos["final_info"]:
                     if finfo and "episode" in finfo:
                         ep_r = finfo["episode"]["r"]
                         ep_l = finfo["episode"]["l"]
-                        # ep_r/ep_l may be numpy scalars
                         ep_r = float(ep_r) if hasattr(ep_r, "item") else ep_r
                         ep_l = float(ep_l) if hasattr(ep_l, "item") else ep_l
                         print(f"global_step={global_step}, episodic_return={ep_r}")
                         writer.add_scalar("charts/episodic_return", ep_r, global_step)
                         writer.add_scalar("charts/episodic_length", ep_l, global_step)
-            
-            # Fallback: older/alternate path (episode info directly in infos)
             elif "episode" in infos:
                 rs = infos["episode"].get("r", [])
                 ls = infos["episode"].get("l", [])
@@ -384,7 +420,7 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", ep_r, global_step)
                     writer.add_scalar("charts/episodic_length", ep_l, global_step)
 
-        # Bootstrap & GAE on realized branch
+        # GAE on realized branch
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards, device=device)
@@ -424,20 +460,15 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
                 mb_obs = b_obs[mb_inds]
-                mean_new, std_new = agent.dist_params(mb_obs)            # [Mb, A]
-                # Broadcast params across K:
-                dist_k = Normal(mean_new.unsqueeze(1), std_new.unsqueeze(1))  # [Mb, 1, A] -> matches [Mb, K, A]
-                
-                # Policy loss over ALL K samples
-                mb_actions_all = b_all_actions[mb_inds]                  # [Mb, K, A]
-                mb_oldlogp_all = b_all_logprobs[mb_inds]                 # [Mb, K]
-                mb_adv_all = b_all_adv[mb_inds]                          # [Mb, K]
-                if args.norm_adv:
-                    m = mb_adv_all.mean()
-                    s = mb_adv_all.std()
-                    mb_adv_all = (mb_adv_all - m) / (s + args.eps_norm)
-                
-                newlogp_all = dist_k.log_prob(mb_actions_all).sum(-1)    # [Mb, K]
+
+                mean_new, std_new = agent.dist_params(mb_obs)                 # [Mb, A]
+                dist_k = Normal(mean_new.unsqueeze(1), std_new.unsqueeze(1))  # [Mb, 1, A] for [Mb, K, A]
+                mb_actions_all = b_all_actions[mb_inds]                       # [Mb, K, A]
+                mb_oldlogp_all = b_all_logprobs[mb_inds]                      # [Mb, K]
+                mb_adv_all = b_all_adv[mb_inds]                               # [Mb, K]
+                # DO NOT renormalize mb_adv_all; it's already tanh-scaled across K.
+
+                newlogp_all = dist_k.log_prob(mb_actions_all).sum(-1)         # [Mb, K]
                 logratio_all = newlogp_all - mb_oldlogp_all
                 ratio_all = torch.exp(logratio_all)
 
@@ -458,7 +489,8 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
 
-                dist_no_k = Normal(mean_new, std_new)                    # [Mb, A]
+                # Entropy from no-K dist
+                dist_no_k = Normal(mean_new, std_new)                         # [Mb, A]
                 entropy_loss = dist_no_k.entropy().sum(-1).mean()
 
                 loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
@@ -476,7 +508,7 @@ if __name__ == "__main__":
             if args.target_kl is not None and approx_kl.item() > args.target_kl:
                 break
 
-        # Logging (exact keys as PPO)
+        # Logging (PPO parity)
         y_pred, y_true = b_values.detach().cpu().numpy(), b_returns.detach().cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1.0 - np.var(y_true - y_pred) / var_y
@@ -488,14 +520,12 @@ if __name__ == "__main__":
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)), global_step)
-        # For Normalize wrappers, explained variance can be a bit noisy
-        # but we keep the exact key for parity with PPO
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
 
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    # Save & optional eval / upload (kept from your PPO script)
+    # Save & optional eval / upload
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
@@ -528,8 +558,9 @@ if __name__ == "__main__":
                 print("HF upload skipped or failed:", e)
 
     envs.close()
+    for penv in probe_envs:
+        penv.close()
 
-    # Optional W&B video upload parity
     if args.track and args.capture_video:
         print("Attempting to upload recorded videos to W&B...")
         video_dir = f"videos/{run_name}"
