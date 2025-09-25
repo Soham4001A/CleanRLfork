@@ -1,30 +1,30 @@
 # Hybrid GRPO (True Node Sampling) for Continuous Actions – CleanRL-style
-# Shadow-env probing + split buffers:
-# - Sample K actions; probe one-step rewards on synchronized SHADOW envs (identical wrappers) and restore shadow base.
-# - Tanh-normalize rewards across K -> per-sample policy advantages (no re-normalization in updates; K=1 uses GAE).
-# - Advance real env only with the executed action (argmax or softmax over standardized rewards).
-# - VALUE LOSS trains on the K-probe **expected Bellman target** per state: E_a[r + gamma * V(s')] (Huber loss).
-# - POLICY trains on B*K samples; VALUE trains on B samples.
-#
-# Logging keys match PPO continuous (no extras).
+# Buffer-scaled + selectable advantage shaping:
+# - Rollout length is scaled by K: rollout_steps = num_steps * K  (more diverse states per update)
+# - At each state, sample K actions, probe 1-step rewards on shadow envs (identical wrappers), then restore
+# - Build policy advantages from sampled rewards with one of two variants:
+#       * pos:      adv_k = tanh(alpha * minmax01(r)) * r            (strictly non-negative, no sign flips)
+#       * centered: same sharpening, then zero-center & std-norm      (more PPO-like/stable)
+# - Advance real env only with the executed action (argmax or softmax over standardized rewards)
+# - Critic = vanilla PPO: GAE on realized branch, MSE (with optional clipping), single optimizer & LR
+# - Logging unchanged (parity with PPO continuous)
 
 import os
 import random
 import time
 from dataclasses import dataclass
+import glob
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import tyro
-import glob
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-# Optional: custom optimizers
+# Optional: custom optimizers (kept for CLI parity; not required)
 try:
     from optim.sgd import AlphaGrad, DAG
 except Exception:
@@ -47,7 +47,7 @@ class Args:
     optimizer: str = "Adam"   # "Adam" | "AlphaGrad" | "DAG"
     alpha: float = 0.0        # AlphaGrad
 
-    # Algo
+    # PPO base
     env_id: str = "HalfCheetah-v5"
     total_timesteps: int = 1_000_000
     learning_rate: float = 3e-4
@@ -58,7 +58,7 @@ class Args:
     gae_lambda: float = 0.95
     num_minibatches: int = 32
     update_epochs: int = 10
-    norm_adv: bool = True     # applies to realized branch only when K=1; K-adv is not re-normalized here
+    norm_adv: bool = True          # used for realized-branch GAE (K=1 fallback) and optional minibatch norm when K>1
     clip_coef: float = 0.2
     clip_vloss: bool = True
     ent_coef: float = 0.0
@@ -66,17 +66,19 @@ class Args:
     max_grad_norm: float = 0.5
     target_kl: float = None
 
-    # Hybrid GRPO specifics
-    num_node_samples: int = 4       # K
-    tanh_temperature: float = 1.0   # tau for tanh(z)
+    # GRPO specifics
+    num_node_samples: int = 4      # K
+    tanh_temperature: float = 1.0  # base temperature; we internally multiply by ~2.5 to sit in active tanh
     eps_norm: float = 1e-8
-    exec_temperature: float = 0.0   # 0 => argmax, >0 => softmax over standardized rewards
+    exec_temperature: float = 0.0  # 0 => argmax, >0 => softmax over standardized rewards
+    adv_variant: str = "centered"  # {"pos","centered"}  (policy advantage shaping)
 
     # runtime (filled in main)
-    batch_size: int = 0
+    rollout_steps: int = 0         # = num_steps * K
+    batch_size: int = 0            # B = num_envs * rollout_steps
     minibatch_size: int = 0
     num_iterations: int = 0
-    batch_size_policy: int = 0
+    batch_size_policy: int = 0     # B * K
     minibatch_size_policy: int = 0
 
 
@@ -88,7 +90,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         else:
             env = gym.make(env_id)
 
-        # match PPO stack
+        # Match PPO stack
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
@@ -141,7 +143,7 @@ class Agent(nn.Module):
         return Normal(mean, std)
 
 
-# ---------- Low-level state copy helpers ----------
+# ---------- State copy helpers for probing ----------
 def _get_base(env):
     cur = env
     while hasattr(cur, "env"):
@@ -208,10 +210,6 @@ def _copy_rms(dst_rms, src_rms):
             pass
 
 def _sync_wrappers(dst_env, src_env):
-    """
-    Copy wrapper states (NormalizeObservation/Reward, running return) from src_env (real)
-    to dst_env (shadow), and copy base state/RNG.
-    """
     def walk_chain(env):
         chain = []
         cur = env
@@ -223,7 +221,6 @@ def _sync_wrappers(dst_env, src_env):
     dst_chain, dst_base = walk_chain(dst_env)
 
     _restore_base_env(dst_base, _snapshot_base_env(src_base))
-
     for w_src, w_dst in zip(src_chain, dst_chain):
         if hasattr(w_src, "obs_rms") and hasattr(w_dst, "obs_rms"):
             _copy_rms(w_dst.obs_rms, w_src.obs_rms)
@@ -244,20 +241,15 @@ def _snapshot_wrappers(env):
     while hasattr(cur, "env"):
         chain.append(cur)
         cur = cur.env
-
     snap = {"_order": [type(w).__name__ for w in chain]}
     for idx, w in enumerate(chain):
         key = f"W{idx}:{type(w).__name__}"
         ws = {}
-
-        # NormalizeObservation
         if hasattr(w, "obs_rms") and w.obs_rms is not None:
             rms = w.obs_rms
             ws["obs_rms_mean"] = np.array(getattr(rms, "mean", 0.0), copy=True)
             ws["obs_rms_var"]  = np.array(getattr(rms, "var", 1.0), copy=True)
             ws["obs_rms_count"]= float(getattr(rms, "count", 1.0))
-
-        # NormalizeReward
         if hasattr(w, "return_rms") and w.return_rms is not None:
             rr = w.return_rms
             ws["ret_rms_mean"] = np.array(getattr(rr, "mean", 0.0), copy=True)
@@ -265,11 +257,8 @@ def _snapshot_wrappers(env):
             ws["ret_rms_count"]= float(getattr(rr, "count", 1.0))
         if hasattr(w, "ret"):
             ws["ret"] = float(w.ret)
-
-        # TimeLimit
         if hasattr(w, "elapsed_steps"):
             ws["elapsed_steps"] = int(w.elapsed_steps)
-
         if ws:
             snap[key] = ws
     return snap
@@ -280,14 +269,11 @@ def _restore_wrappers(env, snap):
     while hasattr(cur, "env"):
         chain.append(cur)
         cur = cur.env
-
     for idx, w in enumerate(chain):
         key = f"W{idx}:{type(w).__name__}"
         if key not in snap:
             continue
         ws = snap[key]
-
-        # NormalizeObservation
         if "obs_rms_mean" in ws and hasattr(w, "obs_rms") and w.obs_rms is not None:
             rms = w.obs_rms
             try:
@@ -306,8 +292,6 @@ def _restore_wrappers(env, snap):
                 rms.var = np.asarray(ws["obs_rms_var"])
             if hasattr(rms, "count"):
                 rms.count = float(ws["obs_rms_count"])
-
-        # NormalizeReward
         if "ret_rms_mean" in ws and hasattr(w, "return_rms") and w.return_rms is not None:
             rr = w.return_rms
             try:
@@ -326,44 +310,40 @@ def _restore_wrappers(env, snap):
                 rr.var = np.asarray(ws["ret_rms_var"])
             if hasattr(rr, "count"):
                 rr.count = float(ws["ret_rms_count"])
-
         if "ret" in ws and hasattr(w, "ret"):
             w.ret = float(ws["ret"])
-
         if "elapsed_steps" in ws and hasattr(w, "elapsed_steps"):
             w.elapsed_steps = int(ws["elapsed_steps"])
 
-def _probe_one_step_with_obs_on_shadow(shadow_env, action_np):
-    """
-    One-step probe on shadow env with full snapshot/restore of base & wrappers.
-    Returns (next_obs, reward, done).
-    """
+def _probe_one_step_reward_with_restore(shadow_env, action_np):
     base = _get_base(shadow_env)
     base_snap = _snapshot_base_env(base)
     wrap_snap = _snapshot_wrappers(shadow_env)
-
-    action_clipped = _clip_to_box(action_np, shadow_env.action_space)
+    a = _clip_to_box(action_np, shadow_env.action_space)
     try:
-        obs_next, r, term, trunc, _ = shadow_env.step(action_clipped)
+        _, r, term, trunc, _ = shadow_env.step(a)
     except gym.error.ResetNeeded:
         shadow_env.reset()
-        obs_next, r, term, trunc, _ = shadow_env.step(action_clipped)
+        _, r, term, trunc, _ = shadow_env.step(a)
     finally:
         _restore_base_env(base, base_snap)
         _restore_wrappers(shadow_env, wrap_snap)
-
-    return obs_next, float(r), bool(term or trunc)
+    return float(r), bool(term or trunc)
 # --------------------------------------------------------------
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)  # B
+
+    # Buffer scaling by K
+    K = max(1, args.num_node_samples)
+    args.rollout_steps = int(args.num_steps * K)                      # more unique states per update
+    args.batch_size = int(args.num_envs * args.rollout_steps)         # B
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
-    # Policy buffer scales by K
-    args.batch_size_policy = args.batch_size * args.num_node_samples
-    args.minibatch_size_policy = max(1, args.minibatch_size * args.num_node_samples)
+    args.num_iterations = args.total_timesteps // (args.num_envs * args.rollout_steps)
+    # Policy sees K samples per state
+    args.batch_size_policy = args.batch_size * K                      # B * K
+    args.minibatch_size_policy = max(1, args.minibatch_size * K)
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
@@ -398,52 +378,36 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    # Shadow probe envs (identical wrapper stack, no video) + reset to satisfy OrderEnforcing
+    # Shadow probe envs (identical wrapper stack, no video)
     probe_envs = [make_env(args.env_id, i + 10_000, False, run_name, args.gamma)() for i in range(args.num_envs)]
     for i, penv in enumerate(probe_envs):
         penv.reset(seed=args.seed + 10_000 + i)
 
     agent = Agent(envs).to(device)
 
-    # ---- Split optimizers: policy vs value (critic LR a bit larger) ----
-    K = max(1, args.num_node_samples)
-    base_lr = args.learning_rate
-    lr_pi_base = base_lr / np.sqrt(K)         # stabilize with larger K
-    lr_v_base  = lr_pi_base * 1.5             # critic slightly faster
-
-    pi_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd]
-    v_params  = list(agent.critic.parameters())
-
+    # Single optimizer & LR like vanilla PPO
     if args.optimizer == "Adam":
-        opt_pi = optim.Adam(pi_params, lr=lr_pi_base, eps=1e-5)
-        opt_v  = optim.Adam(v_params,  lr=lr_v_base,  eps=1e-5)
+        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     elif args.optimizer == "AlphaGrad" and AlphaGrad is not None:
-        opt_pi = AlphaGrad(pi_params, lr=lr_pi_base, alpha=args.alpha, epsilon=1e-5, momentum=0.9)
-        opt_v  = AlphaGrad(v_params,  lr=lr_v_base,  alpha=args.alpha, epsilon=1e-5, momentum=0.9)
+        optimizer = AlphaGrad(agent.parameters(), lr=args.learning_rate, alpha=args.alpha, epsilon=1e-5, momentum=0.9)
     elif args.optimizer == "DAG" and DAG is not None:
-        opt_pi = DAG(pi_params, lr=lr_pi_base, momentum=0.9)
-        opt_v  = DAG(v_params,  lr=lr_v_base,  momentum=0.9)
+        optimizer = DAG(agent.parameters(), lr=args.learning_rate, momentum=0.9)
     else:
-        opt_pi = optim.Adam(pi_params, lr=lr_pi_base, eps=1e-5)
-        opt_v  = optim.Adam(v_params,  lr=lr_v_base,  eps=1e-5)
+        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Storage (PPO-compatible)
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
-    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
-    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
-    values = torch.zeros((args.num_steps, args.num_envs), device=device)
+    # Storage (sized by rollout_steps)
+    obs = torch.zeros((args.rollout_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
+    actions = torch.zeros((args.rollout_steps, args.num_envs) + envs.single_action_space.shape, device=device)
+    logprobs = torch.zeros((args.rollout_steps, args.num_envs), device=device)
+    rewards = torch.zeros((args.rollout_steps, args.num_envs), device=device)
+    dones = torch.zeros((args.rollout_steps, args.num_envs), device=device)
+    values = torch.zeros((args.rollout_steps, args.num_envs), device=device)
 
-    # Critic targets from K probes: V-target per state
-    v_targets = torch.zeros((args.num_steps, args.num_envs), device=device)
-
-    # K-sample buffers
-    K = args.num_node_samples
+    # K-sample buffers (policy-only)
     act_dim = int(np.prod(envs.single_action_space.shape))
-    all_actions = torch.zeros((args.num_steps, args.num_envs, K, act_dim), device=device)
-    all_logprobs = torch.zeros((args.num_steps, args.num_envs, K), device=device)
-    all_advantages = torch.zeros((args.num_steps, args.num_envs, K), device=device)
+    all_actions = torch.zeros((args.rollout_steps, args.num_envs, K, act_dim), device=device)
+    all_logprobs = torch.zeros((args.rollout_steps, args.num_envs, K), device=device)
+    all_advantages = torch.zeros((args.rollout_steps, args.num_envs, K), device=device)
 
     # Rollout
     global_step = 0
@@ -451,21 +415,15 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.tensor(next_obs, device=device, dtype=torch.float32)
     next_done = torch.zeros(args.num_envs, device=device)
-
-    real_envs_list = envs.envs  # list of single envs
+    real_envs_list = envs.envs
 
     for iteration in range(1, args.num_iterations + 1):
-        # Anneal LRs (both policy and value) with K-scaled bases
+        # Anneal LR like PPO (single optimizer)
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lr_pi = float(frac * lr_pi_base)
-            lr_v  = float(frac * lr_v_base)
-            for g in opt_pi.param_groups:
-                g["lr"] = lr_pi
-            for g in opt_v.param_groups:
-                g["lr"] = lr_v
+            optimizer.param_groups[0]["lr"] = float(frac * args.learning_rate)
 
-        for step in range(args.num_steps):
+        for step in range(args.rollout_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
@@ -474,60 +432,72 @@ if __name__ == "__main__":
                 mean, std = agent.dist_params(next_obs)                     # [E, A]
                 dist = Normal(mean, std)
                 k_actions = dist.sample((K,)).transpose(0, 1).contiguous()  # [E, K, A]
-                k_logprobs = dist.log_prob(k_actions).sum(-1)               # [E, K]
+                k_logps = dist.log_prob(k_actions).sum(-1)                  # [E, K]
+                value = agent.get_value(next_obs).squeeze(-1)               # [E]
 
-            # sync shadow envs from real before probing
+            # sync shadow envs for probing
             for e in range(args.num_envs):
                 _sync_wrappers(probe_envs[e], real_envs_list[e])
 
-            # probe on shadow envs: collect rewards for policy-adv AND expected Bellman target for critic
+            # probe rewards
             k_rewards = np.zeros((args.num_envs, K), dtype=np.float32)
-            # accumulate expected target per env: mean_k [ r_k + gamma * (1-done_k) * V(s'_k) ]
-            expected_target = torch.zeros(args.num_envs, device=device)
-
             for e in range(args.num_envs):
                 penv = probe_envs[e]
-                acc = 0.0
                 for ki in range(K):
                     a_np = k_actions[e, ki].detach().cpu().numpy()
-                    obs_next, r_i, done_i = _probe_one_step_with_obs_on_shadow(penv, a_np)
+                    r_i, _ = _probe_one_step_reward_with_restore(penv, a_np)
                     k_rewards[e, ki] = r_i
 
-                    # critic bootstrap at s'_k
-                    obs_next_t = torch.as_tensor(obs_next, device=device, dtype=torch.float32).unsqueeze(0)
-                    with torch.no_grad():
-                        v_sp = agent.get_value(obs_next_t).squeeze(0)  # scalar tensor
-                    acc += r_i + args.gamma * (0.0 if done_i else 1.0) * v_sp.item()
-                expected_target[e] = acc / K
+            # ---- Advantage shaping over K (toggle "pos" vs "centered") ----
+            k_rewards_t = torch.tensor(k_rewards, device=device)             # [E, K]
+            eps = args.eps_norm
 
-            v_targets[step] = expected_target  # save expected Bellman target for critic
+            # Min-max to [0,1] per state (keeps domain positive)
+            r_min = k_rewards_t.min(dim=1, keepdim=True).values
+            r_max = k_rewards_t.max(dim=1, keepdim=True).values
+            r_range = (r_max - r_min).clamp_min(eps)
+            r01 = (k_rewards_t - r_min) / r_range                             # [E, K] in [0,1]
 
-            # tanh-normalized K-advantages (numerically safe, K=1 friendly) for POLICY
-            k_rewards_t = torch.tensor(k_rewards, device=device)
+            # Scale into tanh active region
+            alpha = float(args.tanh_temperature) * 2.5
+            w = torch.tanh(alpha * r01)                                       # (0, tanh(alpha)] ~ (0, ~0.99)
+
+            # Sharpened score
+            score = w * k_rewards_t                                            # [E, K], positive and magnifies top-K
+
+            if args.adv_variant.lower() == "pos":
+                # Strictly non-negative advantages (no sign flips)
+                adv_k = score
+            elif args.adv_variant.lower() == "centered":
+                # Zero-center & std-norm for PPO-like stability
+                score_cent = score - score.mean(dim=1, keepdim=True)
+                score_std = score_cent.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps)
+                adv_k = score_cent / score_std
+            else:
+                raise ValueError(f"Unknown adv_variant {args.adv_variant}. Use 'pos' or 'centered'.")
+
+            # Choose executed action (argmax over standardized rewards z for robust selection)
+            # Use z (standardized raw rewards) to choose; selection independent from adv shaping
             mu = k_rewards_t.mean(dim=1, keepdim=True)
-            stdr = k_rewards_t.std(dim=1, keepdim=True, unbiased=False).clamp_min(args.eps_norm)
+            stdr = k_rewards_t.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps)
             z = (k_rewards_t - mu) / stdr
-            adv_k = torch.tanh(args.tanh_temperature * z)                   # [E, K]
-            adv_k = torch.nan_to_num(adv_k, nan=0.0, posinf=1.0, neginf=-1.0)
 
-            # choose executed action
             if args.exec_temperature > 0.0:
                 weights = torch.softmax(z * args.exec_temperature, dim=1)
                 best_idx = torch.multinomial(weights, num_samples=1).squeeze(1)
             else:
-                best_idx = torch.argmax(k_rewards_t, dim=1)
+                best_idx = torch.argmax(z, dim=1)
+
             chosen_actions = k_actions[torch.arange(args.num_envs), best_idx]  # [E, A]
             chosen_logprobs = dist.log_prob(chosen_actions).sum(-1)            # [E]
-            with torch.no_grad():
-                value = agent.get_value(next_obs).squeeze(-1)                  # [E]
 
-            # store realized branch & K buffers
+            # store
             actions[step] = chosen_actions
             logprobs[step] = chosen_logprobs
             values[step] = value
             rewards[step] = 0.0
             all_actions[step] = k_actions
-            all_logprobs[step] = k_logprobs
+            all_logprobs[step] = k_logps
             all_advantages[step] = adv_k
 
             # step real env
@@ -536,7 +506,7 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward, device=device, dtype=torch.float32)
             next_obs = torch.tensor(next_obs_np, device=device, dtype=torch.float32)
 
-            # episodic logging (gymnasium path then fallback)
+            # episodic logging
             if "final_info" in infos and infos["final_info"] is not None:
                 for finfo in infos["final_info"]:
                     if finfo and "episode" in finfo:
@@ -557,13 +527,13 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", ep_r, global_step)
                     writer.add_scalar("charts/episodic_length", ep_l, global_step)
 
-        # GAE on realized branch (still computed for K=1 policy parity if needed)
+        # GAE on realized branch (vanilla PPO critic targets)
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards, device=device)
             lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
+            for t in reversed(range(args.rollout_steps)):
+                if t == args.rollout_steps - 1:
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
@@ -577,14 +547,12 @@ if __name__ == "__main__":
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)          # [B, ...]
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)        # [B, A]
         b_logprobs = logprobs.reshape(-1)                                          # [B]
-        b_advantages_realized = advantages.reshape(-1)                             # [B]  # used if K==1 for policy
+        b_advantages_realized = advantages.reshape(-1)                             # [B]
+        b_returns = returns.reshape(-1)                                            # [B]
         b_values = values.reshape(-1)                                              # [B]
-        b_v_targets = v_targets.reshape(-1)                                        # [B]  # NEW: critic targets
 
-        # Flatten K-buffers
+        # Flatten K-buffers for policy
         B = args.batch_size
-        K = args.num_node_samples
-        act_dim = int(np.prod(envs.single_action_space.shape))
         b_all_actions = all_actions.reshape(B, K, act_dim)                         # [B, K, A]
         b_all_logprobs = all_logprobs.reshape(B, K)                                # [B, K]
         b_all_adv = all_advantages.reshape(B, K)                                   # [B, K]
@@ -594,13 +562,14 @@ if __name__ == "__main__":
         pol_actions = b_all_actions.reshape(B * K, act_dim)                        # [B*K, A]
         pol_oldlogp = b_all_logprobs.reshape(B * K)                                # [B*K]
         pol_adv = b_all_adv.reshape(B * K)                                         # [B*K]
-        if K == 1:
-            # PPO parity: use realized GAE for policy when K=1
-            pol_adv = b_advantages_realized                                        # [B]
 
-        # Split updates: POLICY over B*K, VALUE over B
+        # K=1 PPO parity (optionally normalize realized GAE)
+        if K == 1 and args.norm_adv:
+            pol_adv = b_advantages_realized
+            pol_adv = (pol_adv - pol_adv.mean()) / (pol_adv.std() + 1e-8)
+
+        # Optimize (single optimizer, policy then value per epoch)
         clipfracs = []
-        policy_kl_vals, policy_oldkl_vals, policy_entropy_vals = [], [], []
         last_pg_loss = torch.tensor(0.0, device=device)
         last_v_loss = torch.tensor(0.0, device=device)
         last_entropy = torch.tensor(0.0, device=device)
@@ -608,22 +577,27 @@ if __name__ == "__main__":
         old_approx_kl = torch.tensor(0.0, device=device)
 
         for epoch in range(args.update_epochs):
-            # -------- POLICY UPDATE over B*K --------
+            # POLICY over B*K
             p_inds = np.arange(args.batch_size_policy)
             np.random.shuffle(p_inds)
+            policy_kl_vals, policy_oldkl_vals, policy_entropy_vals = [], [], []
             for start in range(0, args.batch_size_policy, args.minibatch_size_policy):
                 end = start + args.minibatch_size_policy
                 mbp = p_inds[start:end]
 
                 mb_obs = pol_obs[mbp]
-                mean_new, std_new = agent.dist_params(mb_obs)                      # [MbP, A]
+                mean_new, std_new = agent.dist_params(mb_obs)
                 dist_new = Normal(mean_new, std_new)
 
-                newlogp = dist_new.log_prob(pol_actions[mbp]).sum(-1)              # [MbP]
+                newlogp = dist_new.log_prob(pol_actions[mbp]).sum(-1)
                 logratio = newlogp - pol_oldlogp[mbp]
                 ratio = torch.exp(logratio)
 
-                mb_adv = pol_adv[mbp]  # no re-normalization (already tanh/ranked or GAE)
+                mb_adv = pol_adv[mbp]
+                if K > 1 and args.norm_adv and args.adv_variant.lower() == "centered":
+                    # Light minibatch renorm for stability (no effect on "pos" unless enabled)
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
                 pg_loss1 = -mb_adv * ratio
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
@@ -631,10 +605,10 @@ if __name__ == "__main__":
                 entropy_loss = dist_new.entropy().sum(-1).mean()
                 loss_pg = pg_loss - args.ent_coef * entropy_loss
 
-                opt_pi.zero_grad()
+                optimizer.zero_grad()
                 loss_pg.backward()
-                nn.utils.clip_grad_norm_(pi_params, args.max_grad_norm)
-                opt_pi.step()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
 
                 with torch.no_grad():
                     old_approx_kl_mb = (-logratio).mean()
@@ -646,57 +620,47 @@ if __name__ == "__main__":
                     last_pg_loss = pg_loss
                     last_entropy = entropy_loss
 
-                # Keep logstd sane
                 with torch.no_grad():
                     agent.actor_logstd.clamp_(min=-5.0, max=2.0)
 
-            # Early stop on policy KL if requested
             if args.target_kl is not None and len(policy_kl_vals) > 0 and np.mean(policy_kl_vals) > args.target_kl:
                 approx_kl = torch.tensor(np.mean(policy_kl_vals), device=device)
                 old_approx_kl = torch.tensor(np.mean(policy_oldkl_vals), device=device)
-                break
+                # Early stop policy epochs (value still updates below)
 
-            # -------- VALUE UPDATE over B --------
+            # VALUE over B (vanilla PPO)
             v_inds = np.arange(B)
             np.random.shuffle(v_inds)
             for start in range(0, B, args.minibatch_size):
                 end = start + args.minibatch_size
                 mbv = v_inds[start:end]
 
-                mb_obs_v = b_obs[mbv]
-                new_values = agent.get_value(mb_obs_v).view(-1)
-                mb_targets = b_v_targets[mbv]  # expected Bellman target from K probes
+                new_values = agent.get_value(b_obs[mbv]).view(-1)
+                mb_returns = b_returns[mbv]
 
                 if args.clip_vloss:
-                    v_loss_unclipped = F.smooth_l1_loss(new_values, mb_targets, reduction="none")
+                    v_loss_unclipped = (new_values - mb_returns) ** 2
                     v_clipped = b_values[mbv] + torch.clamp(
                         new_values - b_values[mbv], -args.clip_coef, args.clip_coef
                     )
-                    v_loss_clipped = F.smooth_l1_loss(v_clipped, mb_targets, reduction="none")
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
-                    v_loss = 0.5 * F.smooth_l1_loss(new_values, mb_targets)
+                    v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
 
-                opt_v.zero_grad()
+                optimizer.zero_grad()
                 (args.vf_coef * v_loss).backward()
-                nn.utils.clip_grad_norm_(v_params, args.max_grad_norm)
-                opt_v.step()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
 
                 last_v_loss = v_loss
 
-            # epoch averages for logging
-            if len(policy_kl_vals) > 0:
-                approx_kl = torch.tensor(np.mean(policy_kl_vals), device=device)
-                old_approx_kl = torch.tensor(np.mean(policy_oldkl_vals), device=device)
-                last_entropy = torch.tensor(np.mean(policy_entropy_vals), device=device)
-
-        # Logging (PPO parity) — explained variance vs Bellman targets
-        y_pred, y_true = b_values.detach().cpu().numpy(), b_v_targets.detach().cpu().numpy()
+        # Logging (parity with PPO)
+        y_pred, y_true = b_values.detach().cpu().numpy(), b_returns.detach().cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1.0 - np.var(y_true - y_pred) / var_y
 
-        # Log policy LR (matches PPO key)
-        writer.add_scalar("charts/learning_rate", opt_pi.param_groups[0]["lr"], global_step)
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/policy_loss", float(last_pg_loss.item()), global_step)
         writer.add_scalar("losses/value_loss", float(last_v_loss.item()), global_step)
         writer.add_scalar("losses/entropy", float(last_entropy.item()), global_step)
@@ -713,7 +677,6 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
-
         try:
             from cleanrl_utils.evals.ppo_eval import evaluate
             episodic_returns = evaluate(
@@ -730,7 +693,6 @@ if __name__ == "__main__":
                 writer.add_scalar("eval/episodic_return", episodic_return, idx)
         except Exception as e:
             print("Eval skipped or failed:", e)
-
         if args.upload_model:
             try:
                 from cleanrl_utils.huggingface import push_to_hub
@@ -744,7 +706,6 @@ if __name__ == "__main__":
     for penv in probe_envs:
         penv.close()
 
-    # Optional W&B video upload parity
     if args.track and args.capture_video:
         print("Attempting to upload recorded videos to W&B...")
         video_dir = f"videos/{run_name}"
